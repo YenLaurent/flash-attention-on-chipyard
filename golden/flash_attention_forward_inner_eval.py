@@ -1,0 +1,147 @@
+"""
+用于验证C代码中flash_attention_forward_inner_calc函数的正确性
+包括：
+    - flash_attention_forward_inner_calc 的 Python Golden实现（并非完全一比一复现，可能会有一些误差）
+    - 生成随机Query、Key、Value张量的脚本文件，相关矩阵输出为./source/forward_inner_data.h头文件，可直接用于C端测试
+"""
+
+import torch
+from typing import Tuple
+
+# === 1. 配置参数 (覆盖C中的定义) ===
+BR = 64
+BC = 64
+HEAD_DIM = 64
+SEED = 42
+
+# === 2. Python Golden Model ===
+def flash_attention_forward_inner(q_int8: torch.Tensor, 
+                                  k_int8: torch.Tensor, 
+                                  v_int8: torch.Tensor, 
+                                  s_q: torch.Tensor,
+                                  s_k: torch.Tensor,
+                                  m_old: torch.Tensor,
+                                  l_old: torch.Tensor,
+                                  o_old: torch.Tensor,
+                                  Br: int = BR,
+                                  Bc: int = BC,
+                                  d: int = HEAD_DIM,
+                                  r_glob: int = 0,
+                                  c_glob: int = 0,
+                                  is_causal: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # Returns: (max, l, output)
+    """
+    参照 C 端 flash_attention_forward_inner_calc 的 Python 版本（用于验证）
+
+    Args:
+        q_int8 (torch.Tensor): (Br, d) 查询张量
+        k_int8 (torch.Tensor): (Bc, d) 键张量
+        v_int8 (torch.Tensor): (Bc, d) 值张量
+        s_q (torch.Tensor): (Br,) Query 的 Token Level 缩放因子
+        s_k (torch.Tensor): (Bc,) Key 的 Token Level 缩放因子
+        m_old (torch.Tensor): (Br,) 旧的行最大值
+        l_old (torch.Tensor): (Br,) 旧的行和
+        o_old (torch.Tensor): (Br, d) 旧的输出
+        Br (int): 分块行数
+        Bc (int): 分块列数
+        d (int): 头维度
+        r_glob (int): 全局行偏移
+        c_glob (int): 全局列偏移
+        is_causal (bool): 是否应用因果掩码
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
+            - max (torch.Tensor): (Br,) 最新行最大值
+            - l (torch.Tensor): (Br,) 最新行和
+            - output (torch.Tensor): (Br, d) 最新输出
+    """
+    # Step 1: Q @ K^T
+    #! 必须先把输入的INT8转成Float32，否则matmul会溢出
+    s_float = torch.matmul(q_int8.to(torch.float32), k_int8.t().to(torch.float32)) / d**0.5
+    s_float = torch.matmul(torch.diag(s_q), s_float)
+    s_float = torch.matmul(s_float, torch.diag(s_k))
+
+    # Apply Causal Mask if needed
+    if is_causal:
+        for r in range(s_float.shape[0]):
+            global_row = r_glob + r  # 当前的全局行号
+            for c in range(s_float.shape[1]):
+                global_col = c_glob + c  # 当前的全局列号
+                if global_col > global_row: s_float[r][c] = -1e9  # 使用一个非常小的数代替 -inf，避免数值问题
+
+    # Step 2: Online Safe Softmax
+    max = torch.maximum(m_old, torch.max(s_float, dim=1).values)
+    p_unnormed = torch.exp(s_float - max.unsqueeze(1)).mul(127.0)
+    l = torch.sum(p_unnormed, dim=1) + l_old * torch.exp(m_old - max)
+    p_unnormed_int8 = torch.clamp(torch.round(p_unnormed), -128, 127).to(torch.int8)
+
+    # Step 3: O = P @ V
+    output = torch.matmul(p_unnormed_int8.to(torch.float32), v_int8.to(torch.float32)).to(dtype=torch.float32) + torch.matmul(torch.diag(torch.exp(m_old - max)), o_old)
+
+    return max, l, output
+
+def to_c_array(tensor: torch.Tensor, name: str, type_str: str) -> str:
+    """
+    返回将张量转换为 C 数组表示的字符串（已展平为一维），形式为：static <type_str> <name>[] = { ... };
+    
+    :param tensor: 要转换的张量
+    :type tensor: torch.Tensor
+    :param name: 转换后该数组的名称
+    :type name: str
+    :param type_str: 张量的数据类型字符串（如 "float" 或 "int8_t"）
+    :type type_str: str
+    """
+    flat = tensor.flatten().tolist()
+    if "float" in type_str:
+        data_str = ", ".join([f"{x:.6f}f" for x in flat])
+    else:
+        data_str = ", ".join([str(int(x)) for x in flat])
+    return f"static {type_str} {name}[] = {{{data_str}}};"
+
+if __name__ == "__main__":
+    # === 3. 生成随机数据 ===
+    print("The evaluation of flash_attention_forward_inner_calc starts...")
+    print(f"Parameters: BR={BR}, BC={BC}, HEAD_DIM={HEAD_DIM}, SEED={SEED}")
+
+    torch.manual_seed(SEED)
+
+    # 生成 INT8 范围内的随机整数 (-128 ~ 127)
+    q_int8 = torch.randint(-128, 127, (BR, HEAD_DIM)).to(torch.int8)
+    k_int8 = torch.randint(-128, 127, (BC, HEAD_DIM)).to(torch.int8)
+    v_int8 = torch.randint(-128, 127, (BC, HEAD_DIM)).to(torch.int8)
+
+    # 生成随机 Scale 和 历史状态
+    s_q = torch.rand(BR) / 10.0  # 避免数值过大溢出
+    s_k = torch.rand(BC) / 10.0
+    m_old = torch.zeros(BR) - 1e9 # 初始设为极小值
+    l_old = torch.zeros(BR)
+    o_old = torch.zeros(BR, HEAD_DIM)
+
+    # === 4. 运行参考模型 ===
+    max, l, output = flash_attention_forward_inner(q_int8, k_int8, v_int8, s_q, s_k, m_old, l_old, o_old, is_causal=False)
+
+    print(f"\nGolden Model Output of First 5 elements: \n{output.flatten()[:5]}\nThe max value of first row: {max[0]}\nThe l value of first row: {l[0]}")
+
+    # === 5. 导出为 C 头文件 (.h) ===
+    with open("./source/forward_inner_data.h", "w") as f:
+        f.write(f"#ifndef FORWARD_INNER_DATA_H\n#define FORWARD_INNER_DATA_H\n\n")
+        f.write(f"// Generated by Python script. BR={BR}, BC={BC}, HEAD_DIM={HEAD_DIM}\n")
+        f.write(f"// The arrays have been flattened already.\n")
+        f.write(f"#include \"include/gemmini_params.h\"\n\n") # 确保包含 elem_t 定义
+        
+        # 同时生成分块大小，以便 C 代码中使用
+        f.write(f"#define BR {BR}\n")
+        f.write(f"#define BC {BC}\n")
+        f.write(f"#define HEAD_DIM {HEAD_DIM}\n\n")
+        
+        f.write(to_c_array(q_int8, "q_int8_gen", "elem_t") + "\n")
+        f.write(to_c_array(k_int8, "k_int8_gen", "elem_t") + "\n")
+        f.write(to_c_array(v_int8, "v_int8_gen", "elem_t") + "\n")
+        f.write(to_c_array(s_q, "s_q_gen", "float") + "\n")
+        f.write(to_c_array(s_k, "s_k_gen", "float") + "\n")
+        f.write(to_c_array(m_old, "m_old_gen", "float") + "\n")
+        f.write(to_c_array(l_old, "l_old_gen", "float") + "\n")
+        f.write(to_c_array(o_old, "o_old_gen", "float") + "\n")
+        
+        f.write("\n#endif\n")
+
+    print("\nSuccess! \"forward_inner_data.h\" generated.")

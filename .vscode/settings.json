@@ -1,0 +1,7 @@
+{
+    "files.watcherExclude": {
+        "**/target": true
+    },
+    "C_Cpp.errorSquiggles": "disabled",
+    "python.defaultInterpreterPath": "D:/Anaconda/conda_envs/general/python.exe"
+}
