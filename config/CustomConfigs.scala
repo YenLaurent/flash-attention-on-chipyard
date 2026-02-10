@@ -1,1 +1,16 @@
-//wsl.localhost/Ubuntu-Chipyard/home/yenxu/chipyard/generators/chipyard/src/main/scala/config/CustomConfigs.scala
+package chipyard
+
+import org.chipsalliance.cde.config.{Config}
+import saturn.common.{VectorParams}
+
+// INT8 default Gemmini
+// REFV256D128 Saturn RVV
+// Default Rocket core
+// Without TL Monitors for faster simulation
+class GemminiRocketSaturnConfig extends Config(
+    new gemmini.DefaultGemminiConfig ++
+    new saturn.rocket.WithRocketVectorUnit(256, 128, VectorParams.refParams) ++
+    new chipyard.config.WithSystemBusWidth(128) ++
+    new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+    new freechips.rocketchip.subsystem.WithoutTLMonitors ++
+    new chipyard.config.AbstractConfig)
