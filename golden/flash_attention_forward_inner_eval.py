@@ -1,7 +1,7 @@
 """
 用于验证C代码中flash_attention_forward_inner_calc函数的正确性
 包括：
-    - flash_attention_forward_inner_calc 的 Python Golden实现（并非完全一比一复现，可能会有一些误差）
+    - flash_attention_forward_inner_calc 的 Python Golden实现（并非完全一比一复现，指数计算采用精确数值）
     - 生成随机Query、Key、Value张量的脚本文件，相关矩阵输出为./source/forward_inner_data.h头文件，可直接用于C端测试
 """
 
@@ -31,6 +31,8 @@ def flash_attention_forward_inner(q_int8: torch.Tensor,
                                   is_causal: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # Returns: (max, l, output)
     """
     参照 C 端 flash_attention_forward_inner_calc 的 Python 版本（用于验证）
+
+    除去exp采用精确计算外，其余部分与C保持一致
 
     Args:
         q_int8 (torch.Tensor): (Br, d) 查询张量
@@ -92,7 +94,7 @@ def to_c_array(tensor: torch.Tensor, name: str, type_str: str) -> str:
     """
     flat = tensor.flatten().tolist()
     if "float" in type_str:
-        data_str = ", ".join([f"{x:.6f}f" for x in flat])
+        data_str = ", ".join([f"{x}f" for x in flat])
     else:
         data_str = ", ".join([str(int(x)) for x in flat])
     return f"static {type_str} {name}[] = {{{data_str}}};"
