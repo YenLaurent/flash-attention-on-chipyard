@@ -1,13 +1,15 @@
 """
+硬件在环实验脚本
+
 截取Tiny LLaMA模型第一层的真实Query、Key、Value，将其量化为INT8格式，输出为C代码头文件
 
-同时实际运行前向传播，获得模型困惑度
+同时实际运行前向传播，获得模型标准困惑度
 
-待C读取头文件、运行Int Flash Attention后，读取C端输出结果，注入模型第一层的Attention输出，继续前向传播，获得实际困惑度
+待C读取头文件、运行Chipyard Int Flash Attention后，读取C端输出结果，注入模型第一层的Attention输出，继续前向传播，获得实际困惑度
 """
 import torch
 from pathlib import Path
-from flash_attention_forward_inner_eval import to_c_array
+from golden.flash_attention import to_c_array
 from typing import Callable, Tuple, Optional
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -19,7 +21,7 @@ from transformers.models.llama.modeling_llama import (
 )
 
 BR = 128
-BC = 128
+BC = 256
 SEED = 42
 MODE = "NORMAL"
 
@@ -35,7 +37,7 @@ def write_c_head(Q_int8: torch.Tensor,
                  batch_size: int,
                  br: int = BR,
                  bc: int = BC) -> None:
-    target_header_path = Path("./source/llama_data.h")
+    target_header_path = Path("./bareMetalC/llama_data.h")
 
     with target_header_path.open("w", encoding="utf-8") as f:
         f.write(f"#ifndef LLAMA_DATA_H\n#define LLAMA_DATA_H\n\n")
@@ -93,7 +95,7 @@ def init_int8_attention_data(seq_len: int,
         K_float32 = torch.randn(size=(seq_len, head_dim), dtype=torch.float32)
         V_float32 = torch.randn(size=(seq_len, head_dim), dtype=torch.float32)
     else:
-        assert query is not None and key is not None and value is not None, "When is_random is False, query, key, value must be provided"
+        assert query is not None and key is not None and value is not None, "When is_random is False, query, key, value must be provided."
         Q_float32 = query.float()
         K_float32 = key.float()
         V_float32 = value.float()
@@ -162,6 +164,8 @@ def inject_c_output(output_path: Path,
                         
                         O_c = torch.tensor(values, dtype=torch.float32).reshape(batch_size, num_heads, seq_len, head_dim)
                         return O_c
+    else:
+        raise FileNotFoundError(f"{output_path}文件不存在。")
     
     if O_c.numel() == 0:
         raise ValueError(f"未能从{output_path}中解析出有效数据，请检查C仿真是否成功运行并生成了Log。")
@@ -244,7 +248,7 @@ def custom_forward(
         elif MODE == "INJECT":
             print(f"[Hook] 正在注入 Layer {self.layer_idx} 的 C 代码计算结果...")
 
-            attn_output = inject_c_output(Path("\\wsl.localhost\\Ubuntu-Chipyard\\home\\yenxu\\chipyard\\sims\\verilator\\output\\chipyard.harness.TestHarness.GemminiRocketSaturnConfig\\llama_out.log"),
+            attn_output = inject_c_output(Path(r"\\wsl.localhost\Ubuntu-Chipyard\home\yenxu\chipyard\sims\verilator\output\chipyard.harness.TestHarness.GemminiRocketSaturnConfig\llama_out.log"),
                                           seq_len=query_states.shape[2],
                                           head_dim=query_states.shape[3],
                                           num_heads=query_states.shape[1],
@@ -294,7 +298,7 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0").to(DEVICE)   # type: ignore[call-arg]
     tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-    text = "You talking to me?"
+    text = "多年以后，面对行刑队，奥雷里亚诺·布恩迪亚上校将会回想起父亲带他去见识冰块的那个遥远的下午。那时的马孔多是一个二十户人家的村落，泥巴和芦苇盖成的屋子沿河岸排开，湍急的河水清澈见底，河床里卵石洁白光滑宛如史前巨蛋。世界新生伊始，许多事物还没有名字，提到的时候尚需用手指指点点。"
     input_ids = tokenizer(text, return_tensors="pt").input_ids.to(DEVICE)
     labels = input_ids.clone()
     print(f"Int Flash Attention LlaMA Evaluation Starts...")
@@ -312,16 +316,16 @@ if __name__ == "__main__":
         ppl_golden = torch.exp(loss_golden)
 
     print(f"原始前向传播结束，Golden PPL: {ppl_golden.item():.4f}, Golden Loss: {loss_golden.item():.4f}")
-    print("\n>>> 请运行 C 代码仿真，生成 log 文件后，再运行 INJECT 模式")
+    input("\n>>> 请运行 C 代码仿真，生成 log 文件后，再按任意键运行 INJECT 模式")
 
     # === INJECT 模式 ===
-    # MODE = "INJECT"
-    # print(f"\n>>> Running {MODE} Mode")
-    # with torch.no_grad():
-    #    outputs_c = model(input_ids=input_ids, labels=labels)
-    #    loss_c = outputs_c.loss
-    #    ppl_c = torch.exp(loss_c)
+    MODE = "INJECT"
+    print(f"\n>>> Running {MODE} Mode")
+    with torch.no_grad():
+       outputs_c = model(input_ids=input_ids, labels=labels)
+       loss_c = outputs_c.loss
+       ppl_c = torch.exp(loss_c)
     
-    # print(f"Hardware (Simulated) PPL: {ppl_c.item():.4f}, Hardware (Simulated) Loss: {loss_c.item():.4f}")
-    # print(f"PPL Difference: {abs(ppl_c.item() - ppl_golden.item()):.4f}")
-    # print("\n>>> Evaluation finished. Please check the PPL difference and analyze any discrepancies.")
+    print(f"Hardware (Simulated) PPL: {ppl_c.item():.4f}, Hardware (Simulated) Loss: {loss_c.item():.4f}")
+    print(f"PPL Difference: {abs(ppl_c.item() - ppl_golden.item()):.4f}")
+    print("\n>>> Evaluation finished. Please check the PPL difference and analyze any discrepancies.")
