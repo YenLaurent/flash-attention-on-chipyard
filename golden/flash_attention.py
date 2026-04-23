@@ -10,16 +10,17 @@ Chipyard Int Flash Attention的Python C-Model
 import torch
 from typing import Tuple
 import torch.nn.functional as F
-from typing import Tuple
 from pathlib import Path
 
 # Hyperparameters
-SEQ_LEN = 250
+SEQ_LEN = 1024
 HEAD_DIM = 64
 BR = 128
 BC = 256
 SEED = 23
+SOFTMAX_ACC = "float16"         # Softmax的精度，可选"float16"或"float32"（输入输出仍然为FP32，m, l等全局中间变量仍为FP32）
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+WRITE_OUTPUT = True             # 是否将输出写入文本文件
 
 # Python C-Model Implementation of Flash Attention Forward on Chipyard
 def expp(num_2_calc: torch.Tensor) -> torch.Tensor:
@@ -29,12 +30,13 @@ def expp(num_2_calc: torch.Tensor) -> torch.Tensor:
     Args:
         num_2_calc: The number to be calculated.
     """
+    dtype = num_2_calc.dtype
     # Parameter
-    ln2_inversed = 1.442695040889634
-    alpha = 0.21875
-    beta = 0.4375
-    gamma_1 = 3.296875
-    gamma_2 = 2.171875
+    ln2_inversed = torch.tensor(1.442695040889634, dtype=dtype, device=num_2_calc.device)
+    alpha = torch.tensor(0.21875, dtype=dtype, device=num_2_calc.device)
+    beta = torch.tensor(0.4375, dtype=dtype, device=num_2_calc.device)
+    gamma_1 = torch.tensor(3.296875, dtype=dtype, device=num_2_calc.device)
+    gamma_2 = torch.tensor(2.171875, dtype=dtype, device=num_2_calc.device)
     P = []
     
     x = num_2_calc * ln2_inversed
@@ -42,15 +44,20 @@ def expp(num_2_calc: torch.Tensor) -> torch.Tensor:
     x_frac = x - x_int
 
     # The correction polynomial P(x)
-    p_high = 1 - beta * (1 - x_frac) * (x_frac + gamma_2) # For x >= 0.5
-    p_low = alpha * x_frac * (x_frac + gamma_1)           # For x < 0.5
+    p_high = 1 - beta * (1 - x_frac) * (x_frac + gamma_2)   # For x >= 0.5
+    p_low = (alpha * (x_frac + gamma_1)) * x_frac           # For x < 0.5
     P = torch.where(condition = x_frac >= 0.5,
                     input = p_high,
                     other = p_low)
 
     # The final results
-    expp = (2 ** x_int) * (1 + P)
-    expp = torch.where(num_2_calc < -87.0, torch.zeros_like(expp), expp)
+    x_2pow = 2 ** x_int
+    expp = torch.addcmul(x_2pow, x_2pow, P)
+
+    if dtype == torch.float32:
+        expp = torch.where(num_2_calc < -87.0, torch.zeros_like(expp), expp)
+    elif dtype == torch.float16:
+        expp = torch.where(num_2_calc < -9.7, torch.zeros_like(expp), expp)
     return expp
 
 def flash_attention_forward_inner(q_int8: torch.Tensor, 
@@ -66,27 +73,29 @@ def flash_attention_forward_inner(q_int8: torch.Tensor,
                                   d: int = HEAD_DIM,
                                   r_glob: int = 0,
                                   c_glob: int = 0,
-                                  is_causal: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # Returns: (max, l, output)
+                                  is_causal: bool = True,
+                                  acc: str = SOFTMAX_ACC) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # Returns: (max, l, output)
     """
     参照 C 端 flash_attention_forward_inner_calc 的 Python 版本（用于验证）
 
-    与C保持完全一致
+    与C保持完全一致，支持FP16或FP32的Softmax计算精度（输入输出仍为FP32，m, l等全局中间变量仍为FP32）
 
     Args:
         q_int8 (torch.Tensor): (Br, d) 查询张量
         k_int8 (torch.Tensor): (Bc, d) 键张量
         v_int8 (torch.Tensor): (Bc, d) 值张量
-        s_q (torch.Tensor): (Br,) Query 的 Token Level 缩放因子
-        s_k (torch.Tensor): (Bc,) Key 的 Token Level 缩放因子
-        m_old (torch.Tensor): (Br,) 旧的行最大值
-        l_old (torch.Tensor): (Br,) 旧的行和
-        o_old (torch.Tensor): (Br, d) 旧的输出
+        s_q (torch.Tensor): (Br,) Query 的 Token Level 缩放因子，torch.float32
+        s_k (torch.Tensor): (Bc,) Key 的 Token Level 缩放因子，torch.float32
+        m_old (torch.Tensor): (Br,) 旧的行最大值，torch.float32
+        l_old (torch.Tensor): (Br,) 旧的行和，torch.float32
+        o_old (torch.Tensor): (Br, d) 旧的输出，torch.float32
         Br (int): 分块行数
         Bc (int): 分块列数
         d (int): 头维度
         r_glob (int): 全局行偏移
         c_glob (int): 全局列偏移
         is_causal (bool): 是否应用因果掩码
+        acc (str): Softmax计算的精度，"float16"或"float32"
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
@@ -95,30 +104,34 @@ def flash_attention_forward_inner(q_int8: torch.Tensor,
             - output (torch.Tensor): (Br, d) 最新输出
     """
     device = q_int8.device
+    acc_dtype = torch.float16 if acc == "float16" else torch.float32
+
     # Step 1: Q @ K^T
     # s_int32 = torch.matmul(q_int8.to(torch.int32), k_int8.t().to(torch.int32))
-    s_int32 = torch.matmul(q_int8.to(torch.float32), k_int8.t().to(torch.float32)).round().to(torch.int32)
+    s_int32 = torch.matmul(q_int8.to(torch.float64), k_int8.t().to(torch.float64)).round().to(torch.int32)
     s_float = s_int32.to(torch.float32) * (d ** -0.5)
     s_float = s_float * s_q.unsqueeze(-1)
-    s_float = s_float * s_k.unsqueeze(0)
+    s_float = s_float * s_k.unsqueeze(0)        # float 32
+    s_float = s_float.to(acc_dtype)             # acc_dtype
 
     # Apply Causal Mask if needed
     if is_causal:
         row_idx = torch.arange(Br, device=device) + r_glob
         col_idx = torch.arange(Bc, device=device) + c_glob
         invalid = col_idx.unsqueeze(0) > row_idx.unsqueeze(1)
-        s_float = s_float.masked_fill(invalid, -torch.finfo(torch.float32).max)
+        s_float = s_float.masked_fill(invalid, -torch.finfo(acc_dtype).max)
 
     # Step 2: Online Safe Softmax
-    max = torch.maximum(m_old, torch.max(s_float, dim=1).values)
-    p_unnormed = expp(s_float - max.unsqueeze(1)).mul(127.0)
-    l = torch.sum(p_unnormed, dim=1) + l_old * expp(m_old - max)
-    p_unnormed_int8 = torch.clamp(torch.round(p_unnormed), -128, 127).to(torch.int8)
+    max = torch.maximum(m_old, torch.max(s_float, dim=1).values.to(torch.float32))  # float 32
+    p_unnormed = expp(s_float - max.unsqueeze(1).to(acc_dtype)).mul(127.0)          # acc_dtype
+    l = torch.sum(p_unnormed.to(torch.float32), dim=1) + l_old * expp((m_old - max).to(acc_dtype)).to(torch.float32)  # float 32
+    p_unnormed_int8 = torch.clamp(torch.round(p_unnormed), -128, 127).to(torch.int8)# int 8 / round half to even
 
     # Step 3: O = P @ V
     # O_int32 = torch.matmul(p_unnormed_int8.to(torch.int32), v_int8.to(torch.int32))
-    O_int32 = torch.matmul(p_unnormed_int8.to(torch.float32), v_int8.to(torch.float32)).round().to(torch.int32)
-    output = O_int32.to(torch.float32) + expp(m_old - max).unsqueeze(-1) * o_old
+    O_int32 = torch.matmul(p_unnormed_int8.to(torch.float64), v_int8.to(torch.float64)).round().to(torch.int32)
+    correction = expp(m_old - max).unsqueeze(-1)
+    output = torch.addcmul(input=O_int32.to(torch.float32), tensor1=correction, tensor2=o_old, value=1.0)
 
     return max, l, output
 
@@ -132,7 +145,8 @@ def flash_attention_forward_single_head(Q: torch.Tensor,
                                         bc: int = BC,
                                         seq_len: int = SEQ_LEN,
                                         head_dim: int = HEAD_DIM,
-                                        is_causal: bool = True) -> torch.Tensor:
+                                        is_causal: bool = True,
+                                        acc: str = SOFTMAX_ACC) -> torch.Tensor:
     """
     参考C端 flash_attention_forward_single_head 的 Python 版本（用于验证）
 
@@ -160,6 +174,7 @@ def flash_attention_forward_single_head(Q: torch.Tensor,
     :rtype: Tensor
     """
     device = Q.device
+
     if head_dim is None:
         head_dim = Q.shape[-1]
     if seq_len is None:
@@ -217,14 +232,15 @@ def flash_attention_forward_single_head(Q: torch.Tensor,
                                                                    d = head_dim,
                                                                    r_glob = r_start,
                                                                    c_glob = c_start,
-                                                                   is_causal = is_causal)
+                                                                   is_causal = is_causal,
+                                                                   acc = acc)
 
             m_prev = m_curr
             l_prev = l_curr
             o_prev = o_curr
 
         l_inversed = torch.where(l_curr > 0, 1.0 / l_curr, torch.zeros_like(l_curr))
-        O[r_start:r_end, :] = o_curr[0:r_len, :] * l_inversed[0:r_len].unsqueeze(1) * S_v 
+        O[r_start:r_end, :] = o_curr[0:r_len, :] * l_inversed[0:r_len].unsqueeze(1) * S_v
 
     return O
 
@@ -236,7 +252,8 @@ def flash_attention_forward(query: torch.Tensor,
                             s_v: torch.Tensor,
                             br: int,
                             bc: int,
-                            is_causal: bool = True) -> torch.Tensor:
+                            is_causal: bool = True,
+                            acc: str = SOFTMAX_ACC) -> torch.Tensor:
     """
     多头版本的 Flash Attention Forward 实现，与 Chipyard C 端完全一致
     
@@ -269,7 +286,8 @@ def flash_attention_forward(query: torch.Tensor,
                 br = br,
                 bc = bc,
                 seq_len = seq_len,
-                is_causal = is_causal
+                is_causal = is_causal,
+                acc = acc
             )
             
             O[b, h, :, :] = O_single_head
@@ -301,7 +319,8 @@ def write_c_head(Q_int8: torch.Tensor,
                  V_int8: torch.Tensor,
                  S_q: torch.Tensor,
                  S_k: torch.Tensor,
-                 S_v: torch.Tensor):
+                 S_v: torch.Tensor,
+                 acc: str = SOFTMAX_ACC):
     with open("./bareMetalC/random_data.h", "w") as f:
         f.write(f"#ifndef RANDOM_DATA_H\n#define RANDOM_DATA_H\n\n")
         f.write(f"// Generated by Python script. \n// SEQ_LEN = {SEQ_LEN}, BR = {BR}, BC = {BC}, HEAD_DIM = {HEAD_DIM}, SEED = {SEED}\n")
@@ -311,7 +330,8 @@ def write_c_head(Q_int8: torch.Tensor,
         f.write(f"#define SEQ_LEN {SEQ_LEN}\n")
         f.write(f"#define BR {BR}\n")
         f.write(f"#define BC {BC}\n")
-        f.write(f"#define HEAD_DIM {HEAD_DIM}\n\n")
+        f.write(f"#define HEAD_DIM {HEAD_DIM}\n")
+        f.write(f"#define USE_FP16 false\n\n" if acc == "float32" else f"#define USE_FP16 true\n\n")
 
         f.write(to_c_array(tensor=Q_int8, name="Q_int8_gen", type_str="elem_t") + "\n")
         f.write(to_c_array(tensor=K_int8, name="K_int8_gen", type_str="elem_t") + "\n")
@@ -327,7 +347,7 @@ def init_int8_attention_data(seed = SEED,
                              head_dim: int = HEAD_DIM,
                              device: str = 'cuda' if torch.cuda.is_available() else 'cpu') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    为Attention Forward初始化随机INT8 Q, K, V张量及其缩放因子
+    为Attention Forward初始化随机INT8 Q, K, V张量及其缩放因子，适用于单头前向传播函数
     
     :param seed: 种子
     :type seed: int
@@ -399,7 +419,14 @@ def attention_fp32_single_head_golden(Q_int8: torch.Tensor,
     
     return O_fp32
 
-if __name__ == "__main__":
+def evaluate_flash_attention_forward_single_head(device: str = DEVICE,
+                                                 acc: str = SOFTMAX_ACC,
+                                                 br = BR,
+                                                 bc = BC,
+                                                 seq_len = SEQ_LEN,
+                                                 head_dim = HEAD_DIM,
+                                                 seed = SEED,
+                                                 write_output: bool = WRITE_OUTPUT):
     """
     以下脚本用于评估flash_attention_forward_single_head函数的正确性，流程如下：
 
@@ -408,53 +435,78 @@ if __name__ == "__main__":
     3. 使用flash_attention_forward_single_head函数计算基于Python C-Model实现的Flash Attention输出
     4. 从C端模拟器的输出日志中读取Chipyard Flash Attention输出
     5. 将上述三种结果（Golden, Python实现, C端模拟器）输出到./analysis/data/single_head_outputs/目录下的纯文本文件中，供后续分析使用
-    """    
+    """
+    acc_dtype = torch.float16 if acc == "float16" else torch.float32
     print("The evaluation of flash_attention_forward_single_head starts...")
-    print("Current device:", DEVICE)
+    print(f"Current device: {device}, using {acc_dtype} for softmax calculations.")
 
     # Calculation & Read the C output
-    Q_int8, K_int8, V_int8, S_q, S_k, S_v = init_int8_attention_data(device='cpu') # 确保生成数据时设备一致，否则随机数会有细微差异
-    Q_int8, K_int8, V_int8, S_q, S_k, S_v = Q_int8.to(DEVICE), K_int8.to(DEVICE), V_int8.to(DEVICE), S_q.to(DEVICE), S_k.to(DEVICE), S_v.to(DEVICE)
+    Q_int8, K_int8, V_int8, S_q, S_k, S_v = init_int8_attention_data(device='cpu', seed=seed) # 确保生成数据时设备一致，否则随机数会有细微差异
+    Q_int8, K_int8, V_int8, S_q, S_k, S_v = Q_int8.to(device), K_int8.to(device), V_int8.to(device), S_q.to(device), S_k.to(device), S_v.to(device)
 
-    # Write C header file                
-    write_c_head(Q_int8, K_int8, V_int8, S_q, S_k, S_v)
+    # Write C header file
+    write_c_head(Q_int8, K_int8, V_int8, S_q, S_k, S_v, acc=acc)
 
-    O_golden = attention_fp32_single_head_golden(Q_int8, K_int8, V_int8, S_q, S_k, S_v) # Golden implementation
-    O_python = flash_attention_forward_single_head(Q_int8, K_int8, V_int8, S_q, S_k, S_v, br=BR, bc=BC, seq_len=SEQ_LEN, is_causal=True)  # C Model
-    O_c = torch.tensor([])
+    if write_output:
+        O_golden = attention_fp32_single_head_golden(Q_int8, K_int8, V_int8, S_q, S_k, S_v) # Golden implementation
+        O_python = flash_attention_forward_single_head(Q_int8, K_int8, V_int8, S_q, S_k, S_v, br=br, bc=bc, seq_len=seq_len, is_causal=True, acc=acc)  # C Model
+        O_c = torch.tensor([])
 
-    path2c_output = Path(r"\\wsl.localhost\Ubuntu-Chipyard\home\yenxu\chipyard\sims\verilator\output\chipyard.harness.TestHarness.GemminiRocketSaturnConfig\single_out.log")
-    ANCHOR_STR = "The outputs of shape"
+        if acc == "float16":
+            path2c_output = Path(r"\\wsl.localhost\Ubuntu-Chipyard\home\yenxu\chipyard\sims\verilator\output\chipyard.harness.TestHarness.GemminiRocketSaturnConfigWithFP16\single_out_fp16.log")
+        else:
+            path2c_output = Path(r"\\wsl.localhost\Ubuntu-Chipyard\home\yenxu\chipyard\sims\verilator\output\chipyard.harness.TestHarness.GemminiRocketSaturnConfigWithFP16\single_out_fp32.log")
+        ANCHOR_STR = "The outputs of shape"
 
-    if path2c_output.is_file():
-        with path2c_output.open("r", encoding="utf-8") as f:
-            lines = f.readlines()
-            for idx, line in enumerate(lines):
-                if ANCHOR_STR in line:
-                    if idx + 1 < len(lines):
-                        data_line = lines[idx + 1]
-                        values = [float(x) for x in data_line.strip().split()]
-                        expected_len = SEQ_LEN * HEAD_DIM
-                        if len(values) != expected_len:
-                            print(f"[Warning] Log数据长度 ({len(values)}) 与预期 ({expected_len}) 不符，请检查Log文件完整性。")
-                        
-                        O_c = torch.tensor(values, dtype=torch.float32).reshape(SEQ_LEN, HEAD_DIM)
+        # if path2c_output.is_file():
+        #     with path2c_output.open("r", encoding="utf-8") as f:
+        #         lines = f.readlines()
+        #         for idx, line in enumerate(lines):
+        #             if ANCHOR_STR in line:
+        #                 if idx + 1 < len(lines):
+        #                     data_line = lines[idx + 1]
+        #                     values = [float(x) for x in data_line.strip().split()]
+        #                     expected_len = seq_len * head_dim
+        #                     if len(values) != expected_len:
+        #                         print(f"[Warning] Log数据长度 ({len(values)}) 与预期 ({expected_len}) 不符，请检查Log文件完整性。")
+                            
+        #                     O_c = torch.tensor(values, dtype=torch.float32).reshape(seq_len, head_dim)
+        # else:
+        #     raise FileNotFoundError(f"{path2c_output}文件不存在。")
+
+        # Write output comparison files
+        Path("./analysis/data/single_head_outputs/fp32").mkdir(parents=True, exist_ok=True)
+        Path("./analysis/data/single_head_outputs/fp16").mkdir(parents=True, exist_ok=True)
+
+        if acc == "float32":
+            with open(f"./analysis/data/single_head_outputs/fp32/O_golden_seq{seq_len}_brbc{br}x{bc}.txt", "w") as f:
+                for row in O_golden:
+                    f.write(" ".join([f"{x:.6f}" for x in row]) + "\n\n")
+
+            with open(f"./analysis/data/single_head_outputs/fp32/O_python_seq{seq_len}_brbc{br}x{bc}.txt", "w") as f:
+                for row in O_python:
+                    f.write(" ".join([f"{x:.6f}" for x in row]) + "\n\n")
+            
+            # with open(f"./analysis/data/single_head_outputs/fp32/O_c_seq{seq_len}_brbc{br}x{bc}.txt", "w") as f:
+            #     for row in O_c:
+            #         f.write(" ".join([f"{x:.6f}" for x in row]) + "\n\n")
+        elif acc == "float16":
+            with open(f"./analysis/data/single_head_outputs/fp16/O_golden_seq{seq_len}_brbc{br}x{bc}.txt", "w") as f:
+                for row in O_golden:
+                    f.write(" ".join([f"{x:.6f}" for x in row]) + "\n\n")
+
+            with open(f"./analysis/data/single_head_outputs/fp16/O_python_seq{seq_len}_brbc{br}x{bc}.txt", "w") as f:
+                for row in O_python:
+                    f.write(" ".join([f"{x:.6f}" for x in row]) + "\n\n")
+            
+            # with open(f"./analysis/data/single_head_outputs/fp16/O_c_seq{seq_len}_brbc{br}x{bc}.txt", "w") as f:
+            #     for row in O_c:
+            #         f.write(" ".join([f"{x:.6f}" for x in row]) + "\n\n")
+
+        print(f"Successfully generated \"./bareMetalC/random_data.h\"(parameters: SEQ_LEN={seq_len}, BR={br}, BC={bc}, HEAD_DIM={head_dim}, SEED={seed}), and runs the PyTorch golden model, outputs are in ./analysis/data/single_head_outputs/ file.")
+
     else:
-        raise FileNotFoundError(f"{path2c_output}文件不存在。")
+        print(f"Successfully generated \"./bareMetalC/random_data.h\"(parameters: SEQ_LEN={seq_len}, BR={br}, BC={bc}, HEAD_DIM={head_dim}, SEED={seed}).")
 
-    # Write output comparison files
-    Path("./analysis/data/single_head_outputs/").mkdir(parents=True, exist_ok=True)
-
-    with open(f"./analysis/data/single_head_outputs/O_golden_seq{SEQ_LEN}_brbc{BR}x{BC}.txt", "w") as f:
-        for row in O_golden:
-            f.write(" ".join([f"{x:.6f}" for x in row]) + "\n\n")
-
-    with open(f"./analysis/data/single_head_outputs/O_python_seq{SEQ_LEN}_brbc{BR}x{BC}.txt", "w") as f:
-        for row in O_python:
-            f.write(" ".join([f"{x:.6f}" for x in row]) + "\n\n")
-    
-    with open(f"./analysis/data/single_head_outputs/O_c_seq{SEQ_LEN}_brbc{BR}x{BC}.txt", "w") as f:
-        for row in O_c:
-            f.write(" ".join([f"{x:.6f}" for x in row]) + "\n\n")
-
-    print(f"Successfully generated \"./bareMetalC/random_data.h\"(parameters: SEQ_LEN={SEQ_LEN}, BR={BR}, BC={BC}, HEAD_DIM={HEAD_DIM}, SEED={SEED}), and runs the PyTorch golden model, outputs are in ./analysis/data/single_head_outputs/ file.")
+if __name__ == "__main__":
+    evaluate_flash_attention_forward_single_head()

@@ -6,6 +6,8 @@
 同时实际运行前向传播，获得模型标准困惑度
 
 待C读取头文件、运行Chipyard Int Flash Attention后，读取C端输出结果，注入模型第一层的Attention输出，继续前向传播，获得实际困惑度
+
+TODO: 该测试脚本目前仅支持最初的FP32 Softmax精度，暂不支持FP16 Softmax
 """
 import torch
 from pathlib import Path

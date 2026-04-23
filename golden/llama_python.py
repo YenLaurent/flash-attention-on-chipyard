@@ -21,6 +21,7 @@ BC = 256
 SEED = 42
 MODE = "GOLDEN"  # 可选 "GOLDEN", "PYTHON"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SOFTMAX_ACC = "float16"
 
 
 def init_int8_attention_data(seq_len: int,
@@ -116,7 +117,7 @@ def custom_forward(
 
         global MODE
 
-        if MODE == "PYTHON":
+        if MODE == "PYTHON":                
             Q_int8, K_int8, V_int8, S_q, S_k, S_v = init_int8_attention_data(query=query_states,
                                                                              key=repeat_kv(key_states, self.num_key_value_groups),
                                                                              value=repeat_kv(value_states, self.num_key_value_groups),
@@ -131,7 +132,8 @@ def custom_forward(
                                                   s_v=S_v,
                                                   br=BR,
                                                   bc=BC,
-                                                  is_causal=True)
+                                                  is_causal=True,
+                                                  acc=SOFTMAX_ACC)
             
             # attn_output_duplicate, attn_weights = attention_interface(
             #     self,
@@ -209,6 +211,7 @@ def evaluate_dataset_ppl(
     model.eval()
     if verbose:
         print(f"Evaluation on {device} with {model.__class__.__name__} begins...")
+        print(f"Softmax Accuracy: {SOFTMAX_ACC}")
 
     if max_length <= 1:
         raise ValueError(f"max_length必须大于1，当前是{max_length}")
@@ -239,8 +242,6 @@ def evaluate_dataset_ppl(
 
     corpus = "\n\n".join(texts)
 
-    if verbose:
-        print("[Tokenize] Encoding corpus...")
     enc = tokenizer(corpus, return_tensors="pt")
     input_ids_all = enc["input_ids"].to(device)
     total_len = input_ids_all.size(1)
@@ -269,7 +270,7 @@ def evaluate_dataset_ppl(
 
                 input_ids = input_ids_all[:, begin_loc:end_loc]
                 target_ids = input_ids.clone()
-                target_ids[:, :-trg_len] = -100
+                target_ids[:, :-trg_len] = -100 # 表示从开始取到倒数第trg_len个token
 
                 outputs = model(input_ids=input_ids, labels=target_ids)
                 neg_log_likelihood = outputs.loss.double() * trg_len
@@ -334,7 +335,7 @@ def evaluate_dataset_ppl(
         print(f"Dataset: {result['dataset']} ({split})")
         print(f"Docs: {result['num_docs']}\nTokens: {result['num_tokens']}")
         print(f"GOLDEN PPL: {result['golden']['ppl']:.6f}")
-        print(f"PYTHON PPL: {result['python']['ppl']:.6f}")
+        print(f"PYTHON PPL: {result['python']['ppl']:.6f} (softmax accuracy: {SOFTMAX_ACC})")
         print(f"ABS Diff: {result['delta']['ppl_abs']:.6f}")
         print(f"REL Diff: {result['delta']['ppl_rel_percent']:.6f} %")
 
@@ -347,6 +348,7 @@ def evaluate_words_ppl(text: str,
     input_ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
     labels = input_ids.clone()
     print(f"Int Flash Attention LlaMA Evaluation Starts...")
+    print(f"Softmax Accuracy: {SOFTMAX_ACC}")
     print(f"Input Text: \"{text}\", Sequence Length: {input_ids.shape[1]}")
 
     global MODE
