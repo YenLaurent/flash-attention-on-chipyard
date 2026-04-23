@@ -1,6 +1,6 @@
-# FlashAttention on Chipyard
+# Flash Attention on Chipyard
 
-Chinese version: [README_zh-CN.md](README_zh-CN.md).
+简体中文 | [English](README_zh-CN.md).
 
 ## Table of Contents
 
