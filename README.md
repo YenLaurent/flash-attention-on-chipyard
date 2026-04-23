@@ -1,6 +1,6 @@
 # Flash Attention on Chipyard
 
-简体中文 | [English](README_zh-CN.md)
+English | [简体中文](README_zh-CN.md)
 
 ## Table of Contents
 
