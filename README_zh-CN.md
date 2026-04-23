@@ -1,6 +1,6 @@
 # FlashAttention on Chipyard
 
-English Version: [README.md](README.md)。
+简体中文 | [English](README.md)。
 
 ## 目录
 
